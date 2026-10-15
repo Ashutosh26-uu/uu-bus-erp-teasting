@@ -29,7 +29,19 @@ Personal data and secrets are git-ignored. Copy them to the server by hand:
 The seed file is read **only** when the database is first created. To move an existing installation,
 copy the whole `data/` folder; nothing needs re-seeding.
 
-## Deploying
+## Deploying on Render (recommended)
+
+`render.yaml` sets everything up: Singapore region, a 1 GB persistent disk at `/var/data`, health checks and auto-deploy on every push.
+
+1. Render dashboard → **New → Blueprint** → connect GitHub and pick this repository → **Apply**.
+2. When asked, fill in `SMTP_USER` (the sending Gmail address), `SMTP_PASS` (its 16-character App Password) and `SMTP_FROM` (e.g. `UU Bus ERP <address@gmail.com>`).
+3. Service → **Environment → Secret Files** → add a file named `seed.private.js` and paste the contents of your local `lib/seed.private.js`. Do this **before the first successful start**, because the roster is only read when the database is created. If the service already started with sample data, add the file, then use the Shell tab to run `rm /var/data/db.json` and restart.
+4. Service → **Logs**: on first start the server prints the admin/coordinator login IDs and passwords, and `E-mail: OTPs sent via smtp.gmail.com …`.
+5. Open the `https://uu-bus-erp.onrender.com` address (or add your own domain under **Settings → Custom Domains**).
+
+The `starter` plan is needed because free Render instances have no persistent disk and would lose attendance on every restart.
+
+## Deploying elsewhere
 
 - Use a host with a **persistent disk** (Railway with a volume, Render with a disk, or any VPS). The database is a file in `data/`, and hosts with temporary disks wipe it on restart.
 - Set `DATA_DIR` to the persistent disk path and `PORT` if the host requires it. Start command: `npm start`.

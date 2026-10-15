@@ -1,0 +1,35 @@
+# Render Blueprint — deploys UU Bus ERP as one web service with a persistent disk.
+# Render dashboard → New → Blueprint → pick this repository.
+services:
+  - type: web
+    name: uu-bus-erp
+    runtime: node
+    plan: starter            # a persistent disk needs a paid instance (free instances lose data on restart)
+    region: singapore        # closest Render region to India
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    disk:
+      name: uu-bus-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: DATA_DIR
+        value: /var/data
+      # Upload lib/seed.private.js as a Render "Secret File" named seed.private.js
+      - key: SEED_FILE
+        value: /etc/secrets/seed.private.js
+      # E-mail for password-reset OTPs (values entered in the dashboard, never committed)
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "465"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_FROM
+        sync: false

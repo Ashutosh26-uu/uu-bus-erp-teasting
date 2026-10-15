@@ -3,8 +3,13 @@
   "version": "1.0.0",
   "description": "United University Bus ERP - transport & OTP attendance",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node server.js",
+    "test-email": "node scripts/test-email.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
   "license": "UNLICENSED",
   "private": true
 }
