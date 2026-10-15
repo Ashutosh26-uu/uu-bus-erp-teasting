@@ -1,0 +1,7 @@
+{
+  "host": "smtp.gmail.com",
+  "port": 465,
+  "user": "YOUR_SENDER_EMAIL@gmail.com",
+  "pass": "PASTE_16_CHARACTER_APP_PASSWORD_HERE",
+  "from": "UU Bus ERP <YOUR_SENDER_EMAIL@gmail.com>"
+}

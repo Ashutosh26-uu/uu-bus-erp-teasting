@@ -1,0 +1,10 @@
+{
+  "name": "uu-bus-erp",
+  "version": "1.0.0",
+  "description": "United University Bus ERP - transport & OTP attendance",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=22" },
+  "license": "UNLICENSED",
+  "private": true
+}

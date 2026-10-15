@@ -1,0 +1,9 @@
+{
+  "name": "United University Bus ERP",
+  "short_name": "UU Bus",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#0d2c8c",
+  "icons": [{ "src": "/logo.png", "sizes": "95x107", "type": "image/png" }]
+}

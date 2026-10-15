@@ -1,0 +1,13 @@
+node_modules/
+
+# Runtime data: database, voice notes, generated login credentials
+data/
+
+# Secrets and personal data — copy these to the server by hand
+smtp.config.json
+lib/seed.private.js
+.env
+
+# Local tooling
+.claude/
+*.log
