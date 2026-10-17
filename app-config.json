@@ -4,7 +4,6 @@
   "stack": "node22",
   "memory": 512,
   "env_variables": {
-    "STORAGE": "catalyst",
-    "ZOHO_STRATUS_BUCKET": "uu-bus-erp-data"
+    "STORAGE": "supabase"
   }
 }

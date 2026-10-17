@@ -6,11 +6,17 @@
   "scripts": {
     "start": "node server.js",
     "test-email": "node scripts/test-email.js",
-    "build:catalyst": "node scripts/build-catalyst.js"
+    "build:catalyst": "node scripts/build-catalyst.js",
+    "migrate:supabase": "node scripts/migrate-to-supabase.js",
+    "start:supabase": "node -e \"process.env.STORAGE='supabase';require('./server.js')\""
   },
   "engines": {
     "node": ">=22"
   },
   "license": "UNLICENSED",
-  "private": true
+  "private": true,
+  "dependencies": {
+    "@supabase/ssr": "^0.12.7",
+    "@supabase/supabase-js": "^2.118.0"
+  }
 }

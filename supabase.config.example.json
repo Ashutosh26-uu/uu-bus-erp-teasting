@@ -1,0 +1,4 @@
+{
+  "url": "https://YOUR_PROJECT_REF.supabase.co",
+  "secretKey": "PASTE_YOUR_SUPABASE_SECRET_KEY_HERE (starts with sb_secret_ — NOT the publishable key)"
+}

@@ -176,6 +176,7 @@ let pendingCredentials = null;
 // Fields added after the first release — filled in so older databases keep working.
 function migrate(d) {
   d.events = d.events || [];
+  d.audit.forEach((a) => { if (!a.id) a.id = uid(6); });
   for (const b of BUSES) d.settings[b] = { otpMinutes: 10, geoRadius: 200, ...(d.settings[b] || {}) };
   return d;
 }
@@ -208,7 +209,9 @@ function saveNow() {
   const text = snapshot();
   saving = saving.then(async () => {
     try {
-      await store.saveDb(text);
+      // Row-based stores (Supabase) send only what changed; file stores write the whole snapshot.
+      if (store.saveObject) await store.saveObject(db);
+      else await store.saveDb(text);
       lastSaveError = null;
       const today = fmtDate();
       if (lastBackupDate !== today && (await store.backup(text, today)) !== null) lastBackupDate = today;
@@ -232,7 +235,7 @@ function save() {
 const displayName = (acc) => (acc.role === 'super' ? 'Super Admin' : acc.name);
 const displayWho = (acc) => (acc.role === 'super' ? 'Super Admin' : `${acc.title} — ${acc.name}`);
 function audit(acc, action, detail, bus) {
-  db.audit.push({ at: new Date().toISOString(), user: acc ? `${displayName(acc)} (${acc.username || acc.enroll})` : 'system', role: acc?.role || 'student', action, detail, bus: bus || acc?.bus });
+  db.audit.push({ id: uid(6), at: new Date().toISOString(), user: acc ? `${displayName(acc)} (${acc.username || acc.enroll})` : 'system', role: acc?.role || 'student', action, detail, bus: bus || acc?.bus });
   if (db.audit.length > 5000) db.audit.splice(0, db.audit.length - 5000);
 }
 
@@ -1358,6 +1361,7 @@ async function shutdown() {
   try {
     if (store.saveDbSync) store.saveDbSync(snapshot());
     else await Promise.race([saveNow(), new Promise((r) => setTimeout(r, 5000))]);
+    if (store.release) await Promise.race([store.release(), new Promise((r) => setTimeout(r, 2000))]);
   } catch {}
   process.exit(0);
 }

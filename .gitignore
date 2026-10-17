@@ -2,16 +2,14 @@ node_modules/
 
 # Runtime data: database, voice notes, generated login credentials
 data/
-
 # Secrets and personal data — copy these to the server by hand
 smtp.config.json
 lib/seed.private.js
 .env
-
+supabase.config.json
 # Local tooling
 .claude/
 *.log
-
 # Zoho Catalyst build output and local CLI link
 catalyst-build/
 .catalystrc

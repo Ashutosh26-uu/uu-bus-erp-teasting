@@ -29,7 +29,25 @@ Personal data and secrets are git-ignored. Copy them to the server by hand:
 The seed file is read **only** when the database is first created. To move an existing installation,
 copy the whole `data/` folder; nothing needs re-seeding.
 
-## Deploying on Zoho Catalyst (AppSail + Stratus)
+## Database on Supabase
+
+With `STORAGE=supabase` the app keeps its data in Supabase Postgres. Each student, attendance mark, session, chat, notice and security event is a row in `uubus_records`, with readable views `uubus_students`, `uubus_attendance` and `uubus_security_events`. Voice notes and daily backups go to a private Storage bucket (`uubus-files`, created automatically). A lease row stops two servers from writing at the same time.
+
+1. Supabase dashboard → **SQL Editor** → paste `supabase/schema.sql` → **Run**. This also locks the table so the public/publishable key has no access.
+2. Copy `supabase.config.example.json` to `supabase.config.json` (git-ignored). Fill in the project URL and the **secret** key (Project Settings → API Keys → Secret keys, starts with `sb_secret_`). Never use the secret key in a browser, and never commit it.
+3. Copy the existing local data across once: `npm run migrate:supabase`. Logins and attendance carry over.
+4. Run locally against Supabase with `npm run start:supabase`, or deploy (below). Only one server can use the database at a time.
+
+## Deploying on Zoho Catalyst AppSail (with Supabase)
+
+This folder is linked to the Catalyst project via `catalyst.json` and `.catalystrc`. `app-config.json` sets `STORAGE=supabase`.
+```bash
+npm run build:catalyst
+catalyst deploy appsail --name uu-bus-erp
+```
+`build:catalyst` puts the app, your private roster, and the e-mail and Supabase settings into `catalyst-build/`. These are uploaded to Zoho only, never to GitHub. Set the AppSail health-check path to `/api/health`.
+
+## Deploying on Zoho Catalyst with Stratus (alternative to Supabase)
 
 AppSail containers have no permanent disk, so the app stores its database, daily backups and voice notes in a **Catalyst Stratus** bucket (`lib/store-catalyst.js`, official `@zcatalyst/stratus` SDK).
 
