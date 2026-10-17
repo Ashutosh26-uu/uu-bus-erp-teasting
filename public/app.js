@@ -8,10 +8,29 @@
     set(k, v) { try { localStorage.setItem('uubus.' + k, JSON.stringify(v)); } catch {} },
     del(k) { try { localStorage.removeItem('uubus.' + k); } catch {} },
   };
-  let deviceId = store.get('device');
-  if (!deviceId) {
-    deviceId = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now()).replace(/-/g, '');
-    store.set('device', deviceId);
+  // Device ID: kept in localStorage AND a long-lived cookie, so clearing one doesn't change the phone's identity.
+  const cookieDevice = (document.cookie.match(/(?:^|;\s*)uudev=([a-f0-9]{16,64})/) || [])[1];
+  let deviceId = store.get('device') || cookieDevice;
+  if (!deviceId) deviceId = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now()).replace(/-/g, '').replace(/[^a-f0-9]/g, 'a');
+  store.set('device', deviceId);
+  try { document.cookie = `uudev=${deviceId}; max-age=${60 * 60 * 24 * 400}; path=/; samesite=lax${location.protocol === 'https:' ? '; secure' : ''}`; } catch {}
+
+  // QR deep link: https://…/?bus=UU-10&code=123456 (scanned from the admin's screen)
+  const qp = new URLSearchParams(location.search);
+  const deepLink = qp.get('bus') ? { bus: qp.get('bus'), code: (qp.get('code') || '').replace(/\D/g, '').slice(0, 6) } : null;
+  if (deepLink) history.replaceState(null, '', location.pathname);
+
+  // Location helper (needs https or localhost).
+  function getLocation(timeout = 15000) {
+    return new Promise((resolve, reject) => {
+      if (!navigator.geolocation) return reject(new Error('This browser cannot share location.'));
+      if (!window.isSecureContext) return reject(new Error('Location needs a secure (https) link. Open the portal using its https:// address.'));
+      navigator.geolocation.getCurrentPosition(
+        (p) => resolve({ lat: p.coords.latitude, lng: p.coords.longitude, acc: Math.round(p.coords.accuracy) }),
+        (e) => reject(new Error(e.code === 1 ? 'Location permission was denied. Allow location for this site in your browser settings and try again.' : 'Could not get your location. Turn on GPS/location and try again.')),
+        { enableHighAccuracy: true, timeout, maximumAge: 10000 },
+      );
+    });
   }
 
   const S = {
@@ -31,6 +50,8 @@
     coordRange: '7d',
     report: null,
     chatWith: null,
+    pendingCode: deepLink && deepLink.code ? deepLink.code : null,
+    secRange: '7d',
   };
 
   // ---------- utils ----------
@@ -112,6 +133,23 @@
   function otpShareMessage(s, bus) {
     const mins = Math.max(1, Math.round((new Date(s.expiresAt).getTime() - serverNow()) / 60000));
     const by = S.user && S.user.role === 'super' ? 'Super Admin' : `${S.user.title} — ${S.user.name}`;
+    if (s.mode === 'rotating') {
+      // A rotating code expires every 30 s, so the message invites students to scan in the bus instead.
+      return [
+        `🚌 *United University — Bus ${bus}*`,
+        `✅ *${s.trip} trip attendance is LIVE now*`,
+        '',
+        `⏰ Open till *${clock(s.expiresAt)}* (about ${mins} min)`,
+        '',
+        '📷 *Scan the QR code on the bus incharge\'s phone* with your camera — it opens the portal and marks you present.',
+        `No camera scan? Open ${location.origin}, select bus *${bus}*, tap your name and type the code shown on the screen.`,
+        s.requireGeo ? '📍 Your phone will ask for location — tap *Allow*. You must be in the bus.' : '',
+        '',
+        '⚠️ The code changes every 30 seconds, so forwarded codes will not work. Mark only your own attendance, from your own phone.',
+        '',
+        `— ${by}`,
+      ].filter((l, i, a) => l !== '' || a[i - 1] !== '').join('\n');
+    }
     return [
       `🚌 *United University — Bus ${bus}*`,
       `✅ *${s.trip} trip attendance is LIVE now*`,
@@ -215,9 +253,11 @@
       const start = new Date(el.dataset.start || el.dataset.expires).getTime();
       const left = Math.max(0, exp - serverNow());
       const h = Math.floor(left / 3600000), m = Math.floor((left % 3600000) / 60000), s = Math.floor((left % 60000) / 1000);
-      const t = el.querySelector('.timer');
+      // only this element's own timer/bar, not those of a nested countdown
+      const own = (sel) => [...el.querySelectorAll(sel)].find((x) => x.closest('[data-expires]') === el);
+      const t = own('.timer');
       if (t) t.textContent = (h ? `${h}:${String(m).padStart(2, '0')}` : m) + `:${String(s).padStart(2, '0')}`;
-      const bar = el.querySelector('.timer-bar i');
+      const bar = own('.timer-bar i');
       if (bar && exp > start) bar.style.width = Math.min(100, (left / (exp - start)) * 100) + '%';
       if (left === 0 && !el.dataset.done) { el.dataset.done = '1'; if (el.dataset.onexpire && expiredHandler) setTimeout(expiredHandler, 700); }
     });
@@ -261,6 +301,7 @@
       const state = s ? (s.alreadyMarked ? 'done' : 'live') : 'closed';
       const prev = S.portalSeen;
       S.portalSeen = state;
+      if (prev === undefined && S.fromQR) { S.fromQR = false; return; } // came from a QR scan: marking is already under way
       if (prev === undefined) return portalPopup(state, s);
       if (prev === state) return;
       if (state === 'live') portalPopup('live', s);
@@ -279,6 +320,8 @@
   function render() {
     setPoll(null);
     clearInterval(watchTimer);
+    clearTimeout(codeTimer);
+    if (S.view !== 'staff') stopBusGps(); // bus GPS keeps running while the admin moves between tabs
     stopRecording(true);
     expiredHandler = null;
     const app = $('#app');
@@ -439,48 +482,64 @@
             ? `${esc(ref.trip)} trip · ${esc(niceDate(ref.date))}${cur && cur.marked ? ` · ${esc(cur.time)}${cur.method === 'ADMIN' ? ' (marked by admin)' : ''}` : ''}`
             : s ? `${esc(s.trip)} trip is open — enter the OTP below` : 'This turns green after you enter the OTP'}</p>
         </div>
+        ${d.phone === 'other' && !marked ? `<div class="alert err mt">${I.lock.replace('<svg', '<svg style="width:15px;vertical-align:-2px"')} Your name is linked to a <b>different phone</b>. Mark from your own phone, or ask your bus incharge to reset the phone link if you changed phones.</div>` : ''}
         <div class="card mt otp-card ${s && !marked ? '' : 'disabled'}" ${s && !marked ? `data-expires="${s.expiresAt}" data-start="${s.createdAt}" data-onexpire="1"` : ''}>
-          <div class="row-between"><h3 style="margin:0">Enter OTP</h3>
+          <div class="row-between"><h3 style="margin:0">${s && s.mode === 'rotating' ? 'Enter the code shown in the bus' : 'Enter OTP'}</h3>
             ${s && !marked ? '<span class="badge green"><span class="dot pulse"></span> Open · <span class="timer">--:--</span></span>' : marked ? '<span class="badge green">Done</span>' : '<span class="badge gray">Portal closed</span>'}</div>
           ${s && !marked ? '<div class="timer-bar"><i style="width:100%"></i></div>' : ''}
+          ${s && !marked && (s.requireGeo || s.mode === 'rotating') ? `<div class="chips mt">${s.mode === 'rotating' ? '<span class="badge">🔄 Code changes every 30 s — scan the QR</span>' : ''}${s.requireGeo ? `<span class="badge orange">📍 Location check · within ${s.geoRadius} m of the bus</span>` : ''}</div>` : ''}
           <form id="otp-form">
-            <input class="otp-one" id="otp-one" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="••••••" aria-label="6-digit OTP" ${s && !marked ? '' : 'disabled'}>
+            <input class="otp-one" id="otp-one" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="••••••" aria-label="6-digit code" ${s && !marked ? '' : 'disabled'}>
             <button class="btn orange block" id="otp-btn" ${s && !marked ? '' : 'disabled'}>${I.check} Mark my attendance</button>
           </form>
-          <p class="small muted center" style="margin:10px 0 0">${s && !marked
-            ? `OTP shared by ${esc(s.createdBy)}.${s.attemptsLeft < 5 ? ` <b>${s.attemptsLeft} attempts left.</b>` : ''}`
-            : marked ? 'Your attendance is saved.' : 'The OTP box unlocks when the bus incharge makes the portal live.'}</p>
+          <p class="small muted center" style="margin:10px 0 0" id="otp-note">${s && !marked
+            ? `${s.mode === 'rotating' ? 'Scan the QR code on the bus incharge\'s screen with your camera, or type the 6-digit code.' : `OTP shared by ${esc(s.createdBy)}.`}${s.requireGeo ? ' Your phone will ask to share your location — tap Allow.' : ''}${s.attemptsLeft < 5 ? ` <b>${s.attemptsLeft} attempts left.</b>` : ''}`
+            : marked ? 'Your attendance is saved.' : 'The code box unlocks when the bus incharge makes the portal live.'}</p>
         </div>`;
       if (!s || marked) return;
       const inp = $('#otp-one', box);
       inp.addEventListener('input', () => (inp.value = inp.value.replace(/\D/g, '').slice(0, 6)));
-      $('#otp-form', box).onsubmit = async (e) => {
-        e.preventDefault();
-        if (inp.value.length !== 6) return toast('Enter the 6-digit OTP', 'err');
+      const submit = async () => {
+        if (inp.value.length !== 6) return toast('Enter the 6-digit code', 'err');
+        const btn = $('#otp-btn');
         try {
-          const r = await busy($('#otp-btn'), () => post('/api/public/mark', { enroll: S.me.enroll, bus: S.me.bus, otp: inp.value, deviceId }));
+          const r = await busy(btn, async () => {
+            let loc = {};
+            if (s.requireGeo) {
+              btn.innerHTML = '📍 Checking your location…';
+              loc = await getLocation();
+            }
+            btn.innerHTML = 'Marking…';
+            return post('/api/public/mark', { enroll: S.me.enroll, bus: S.me.bus, otp: inp.value, deviceId, ...loc });
+          });
           toast(`Marked present at ${r.record.time}`, 'ok');
           if (navigator.vibrate) navigator.vibrate(80);
           sig = null; load();
         } catch (err) {
           if (handleStudentErr(err)) return;
-          toast(err.message, 'err');
+          if (['TOO_FAR', 'PHONE_MISMATCH', 'PHONE_REUSED', 'NEED_LOCATION'].includes(err.code) || /location/i.test(err.message)) {
+            modal(`<div class="portal-pop closed"><div class="pp-icon">${err.code === 'TOO_FAR' ? I.pin : I.lock}</div><h2>${{ TOO_FAR: 'Not near the bus', PHONE_MISMATCH: 'Different phone', PHONE_REUSED: 'Phone already used' }[err.code] || 'Location needed'}</h2><p>${esc(err.message)}</p><button class="btn outline block" data-close>OK</button></div>`, null, { cls: 'narrow' });
+          } else toast(err.message, 'err');
           inp.value = ''; inp.focus();
           if (/attempt|closed|already/i.test(err.message)) { sig = null; load(); }
         }
       };
+      $('#otp-form', box).onsubmit = (e) => { e.preventDefault(); submit(); };
+      // Arrived by scanning the QR: fill in the code and mark straight away.
+      if (S.pendingCode) { inp.value = S.pendingCode; S.pendingCode = null; submit(); }
     };
     const load = async () => {
       let d;
-      try { d = await get('/api/public/student?' + qs({ enroll: S.me.enroll, bus: S.me.bus })); } catch (e) { handleStudentErr(e); return; }
+      try { d = await get('/api/public/student?' + qs({ enroll: S.me.enroll, bus: S.me.bus, deviceId })); } catch (e) { handleStudentErr(e); return; }
       if (!$('#st-details')) return;
+      if (S.pendingCode && !d.session) { toast('The attendance portal is closed — this QR code has expired.', 'err'); S.pendingCode = null; }
       syncClock(d.serverNow);
       S.student = d.student;
       drawDetails(d.student);
       const badge = $('#chat-badge');
       if (badge) { badge.hidden = !d.unreadChats; badge.textContent = d.unreadChats; }
       const s = d.session;
-      const nsig = JSON.stringify([s && s.id, s && s.alreadyMarked, s && s.expiresAt, d.current]);
+      const nsig = JSON.stringify([s && s.id, s && s.alreadyMarked, s && s.expiresAt, d.current, d.phone]);
       if (nsig !== sig) { sig = nsig; drawMain(d); }
       $('#att-today').innerHTML = `<div class="card"><h3>Today · ${esc(niceDate(d.today))}</h3>${['Morning', 'Evening'].map((t) => {
         const r = d.todayRecords.find((x) => x.trip === t);
@@ -827,6 +886,37 @@
   }
 
   // ---------- admin: live ----------
+  let codeTimer = null;
+  let qrLib = null;
+  function loadQrLib() {
+    if (window.qrcode) return Promise.resolve(window.qrcode);
+    if (!qrLib) qrLib = new Promise((resolve, reject) => {
+      const sc = document.createElement('script');
+      sc.src = 'https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js';
+      sc.onload = () => (window.qrcode ? resolve(window.qrcode) : reject(new Error('QR library failed')));
+      sc.onerror = () => { qrLib = null; reject(new Error('QR library failed to load')); };
+      document.head.appendChild(sc);
+    });
+    return qrLib;
+  }
+  // Bus GPS: watch this phone's position and send it at most every 15 s while the portal is live.
+  let gpsWatch = null, gpsLastSent = 0, gpsBus = null;
+  function startBusGps(bus) {
+    if (gpsWatch !== null && gpsBus === bus) return;
+    stopBusGps();
+    if (!navigator.geolocation || !window.isSecureContext) return;
+    gpsBus = bus;
+    gpsWatch = navigator.geolocation.watchPosition((p) => {
+      if (Date.now() - gpsLastSent < 15000) return;
+      gpsLastSent = Date.now();
+      post('/api/admin/session/location', { bus, lat: p.coords.latitude, lng: p.coords.longitude, acc: Math.round(p.coords.accuracy) }).catch(() => {});
+    }, () => {}, { enableHighAccuracy: true, maximumAge: 10000, timeout: 30000 });
+  }
+  function stopBusGps() {
+    if (gpsWatch !== null && navigator.geolocation) navigator.geolocation.clearWatch(gpsWatch);
+    gpsWatch = null; gpsBus = null;
+  }
+
   function adminLive(view) {
     const bus = S.adminBus;
     let sig = null, data = null;
@@ -846,16 +936,25 @@
         const mins = data.settings.otpMinutes;
         const inHours = mins >= 60 && mins % 60 === 0;
         const trip = S.live.trip || data.trip;
+        const mode = S.live.mode || 'rotating';
+        const geoOn = S.live.geo !== false;
         box.innerHTML = `<div class="card" style="height:100%">
-          <h2>Make the portal live</h2><p class="sub">Generate an OTP and announce it in the bus. The portal closes automatically when the time runs out.</p>
+          <h2>Make the portal live</h2><p class="sub">Students mark attendance only while the portal is live. It closes automatically when the time runs out.</p>
           <label class="field"><span>Trip</span><div class="seg" style="margin:0" id="trip-seg">${['Morning', 'Evening'].map((t) => `<button type="button" data-t="${t}" class="${trip === t ? 'active' : ''}">${t}</button>`).join('')}</div></label>
-          <label class="field"><span>OTP valid for</span>
+          <label class="field"><span>Code type</span><div class="seg" style="margin:0" id="mode-seg">
+            <button type="button" data-mode="rotating" class="${mode === 'rotating' ? 'active' : ''}">🔄 Rotating QR (safest)</button>
+            <button type="button" data-mode="fixed" class="${mode === 'fixed' ? 'active' : ''}">🔑 Fixed OTP</button></div>
+            <small class="muted">${mode === 'rotating' ? 'Students scan a QR on your screen; the code changes every 30 s, so a forwarded code stops working almost at once.' : 'One code for the whole trip — can be shared on WhatsApp, but is easier to leak.'}</small></label>
+          <label class="check"><input type="checkbox" id="geo-on" ${geoOn ? 'checked' : ''}> 📍 Location check — students must be within <b>${data.settings.geoRadius} m</b> of this phone (keep this page open in the bus)</label>
+          <label class="field mt"><span>Portal open for</span>
             <div class="row" style="align-items:center;flex-wrap:nowrap"><input class="input" id="otp-val" type="number" min="1" max="240" value="${inHours ? mins / 60 : mins}" style="max-width:100px;flex:0 0 100px">
             <select class="input" id="otp-unit" style="max-width:130px;flex:0 0 130px"><option value="1" ${inHours ? '' : 'selected'}>minutes</option><option value="60" ${inHours ? 'selected' : ''}>hours</option></select></div></label>
           <div class="chips mb">${[[2, '2 min'], [5, '5 min'], [10, '10 min'], [15, '15 min'], [30, '30 min'], [60, '1 hour'], [120, '2 hours']].map(([m, l]) => `<button type="button" class="chip ${m === mins ? 'active' : ''}" data-m="${m}">${l}</button>`).join('')}</div>
-          <button class="btn orange block" id="otp-gen">${I.key} Generate OTP &amp; go live</button>
+          <button class="btn orange block" id="otp-gen">${I.key} Go live</button>
         </div>`;
         $$('#trip-seg [data-t]').forEach((b) => (b.onclick = () => { S.live.trip = b.dataset.t; sig = null; refresh(); }));
+        $$('#mode-seg [data-mode]').forEach((b) => (b.onclick = () => { S.live.mode = b.dataset.mode; sig = null; drawOtp(); }));
+        $('#geo-on').onchange = (e) => (S.live.geo = e.target.checked);
         $$('[data-m]', box).forEach((c) => (c.onclick = () => {
           const m = Number(c.dataset.m);
           $('#otp-val').value = m >= 60 ? m / 60 : m; $('#otp-unit').value = m >= 60 ? '60' : '1';
@@ -864,34 +963,67 @@
         $('#otp-gen').onclick = async (e) => {
           const minutes = Number($('#otp-val').value) * Number($('#otp-unit').value);
           if (!(minutes >= 1 && minutes <= 240)) return toast('Validity must be between 1 minute and 4 hours', 'err');
+          const btn = e.currentTarget;
+          const requireGeo = $('#geo-on').checked;
           try {
-            await busy(e.currentTarget, () => post('/api/admin/session/start', { bus, trip: S.live.trip || data.trip, minutes }));
-            toast('Portal is live — announce the OTP', 'ok');
+            await busy(btn, async () => {
+              let loc = {};
+              if (requireGeo) {
+                btn.innerHTML = '📍 Getting the bus location…';
+                loc = await getLocation(20000);
+              }
+              return post('/api/admin/session/start', { bus, trip: S.live.trip || data.trip, minutes, mode, requireGeo, ...loc });
+            });
+            toast(mode === 'rotating' ? 'Portal is live — show the QR code to students' : 'Portal is live — announce the OTP', 'ok');
             sig = null; refresh();
           } catch (err) {
             if (err.code === 'BUSY') { popup5('OTP is being generated', `The OTP for ${esc(bus)} is already being generated by <b>${esc(err.by)}</b>.`); sig = null; refresh(); }
+            else if (/location/i.test(err.message)) modal(`<div class="portal-pop closed"><div class="pp-icon">${I.pin}</div><h2>Location needed</h2><p>${esc(err.message)}</p><p>Or untick <b>Location check</b> to go live without it.</p><button class="btn outline block" data-close>OK</button></div>`, null, { cls: 'narrow' });
             else toast(err.message, 'err');
           }
         };
         return;
       }
-      box.innerHTML = `<div class="otp-display" data-expires="${s.expiresAt}" data-start="${s.createdAt}" data-onexpire="1">
-        <div class="label">${esc(s.trip)} trip · Attendance OTP</div>
+      const rotating = s.mode === 'rotating';
+      const scanUrl = `${location.origin}/?bus=${encodeURIComponent(bus)}&code=${s.otp}`;
+      const g = s.busGeo;
+      const geoLine = !s.requireGeo ? '📍 Location check off'
+        : !g ? '📍 Waiting for bus location…'
+        : g.stale ? `⚠️ Bus location is ${Math.round((serverNow() - new Date(g.at)) / 60000)} min old — keep this page open on the phone in the bus`
+        : `📍 Location check on · ${s.geoRadius} m · bus GPS ±${g.acc} m`;
+      box.innerHTML = `<div class="otp-display ${rotating ? 'rotating' : ''}" data-expires="${s.expiresAt}" data-start="${s.createdAt}" data-onexpire="1">
+        <div class="label">${esc(s.trip)} trip · ${rotating ? 'Scan to mark attendance' : 'Attendance OTP'}</div>
+        ${rotating ? `<div class="qr-wrap"><div class="qr-box" id="qr-box"><div class="muted small">Loading QR…</div></div></div>` : ''}
         <div class="otp-digits">${esc(s.otp)}</div>
+        ${rotating ? `<div class="code-cycle" data-expires="${s.codeWindowEnds}" data-start="${new Date(new Date(s.codeWindowEnds).getTime() - s.codeWindowSec * 1000).toISOString()}"><span>New code in <span class="timer">--</span></span><div class="timer-bar"><i style="width:100%"></i></div></div>` : ''}
         <div>Portal closes in <span class="timer">--:--</span></div>
         <div class="timer-bar"><i style="width:100%"></i></div>
+        <div class="geo-line ${g && g.stale ? 'warn' : ''}">${geoLine}</div>
         <div class="btn-row">
           <button class="btn sm ghost" data-act="extend" data-min="5">+5 min</button>
           <button class="btn sm ghost" data-act="extend" data-min="15">+15 min</button>
-          <button class="btn sm ghost" data-act="regenerate">${I.refresh} New OTP</button>
+          <button class="btn sm ghost" data-act="regenerate">${I.refresh} New ${rotating ? 'QR' : 'OTP'}</button>
           <button class="btn sm red" data-act="close">${I.lock} Close now</button>
         </div>
         <div class="btn-row share-row">
-          <a class="btn sm wa" id="wa-share" target="_blank" rel="noopener noreferrer">${I.whatsapp} Share OTP on WhatsApp</a>
+          <a class="btn sm wa" id="wa-share" target="_blank" rel="noopener noreferrer">${I.whatsapp} ${rotating ? 'Tell students on WhatsApp' : 'Share OTP on WhatsApp'}</a>
           <button class="btn sm ghost" id="otp-copy">Copy message</button>
         </div>
         <div class="small" style="opacity:.85;margin-top:10px;position:relative;z-index:1">Generated by ${esc(s.createdByUser === data.me ? 'you' : s.createdBy)} at ${esc(clock(s.createdAt))}</div>
       </div>`;
+      if (rotating) {
+        loadQrLib().then((qrcode) => {
+          const el = $('#qr-box');
+          if (!el) return;
+          const qr = qrcode(0, 'M');
+          qr.addData(scanUrl);
+          qr.make();
+          el.innerHTML = qr.createSvgTag({ cellSize: 6, margin: 2, scalable: true });
+        }).catch(() => { const el = $('#qr-box'); if (el) el.innerHTML = '<div class="small">QR unavailable offline — students can type the code.</div>'; });
+        // Fetch the next code right when this one expires.
+        clearTimeout(codeTimer);
+        codeTimer = setTimeout(() => { if ($('#lv-otp')) refresh(); }, Math.max(500, new Date(s.codeWindowEnds) - serverNow() + 400));
+      }
       const shareText = otpShareMessage(s, bus);
       $('#wa-share', box).href = 'https://wa.me/?text=' + encodeURIComponent(shareText);
       $('#otp-copy', box).onclick = () => navigator.clipboard?.writeText(shareText).then(() => toast('Message copied — paste it in WhatsApp', 'ok')).catch(() => toast('Copy failed', 'err'));
@@ -919,9 +1051,12 @@
         </div>
       </div>`;
       const w = data.working;
-      $('#lv-window').innerHTML = !data.session && w && data.canManual
+      const alerts = data.alerts ? `<div class="alert err mt row-between"><span>🛡️ <b>${data.alerts}</b> blocked attempt${data.alerts > 1 ? 's' : ''} this trip (wrong code, far away or another phone).</span><button class="btn sm outline" id="see-alerts">View</button></div>` : '';
+      $('#lv-window').innerHTML = alerts + (!data.session && w && data.canManual
         ? `<div class="alert warn mt">The ${esc(w.trip)} portal closed at ${esc(clock(w.closedAt || w.expiresAt))}. You can still mark students manually until <b>${esc(clock(w.manualUntil))}</b>; after that, unmarked students remain absent.</div>`
-        : data.session ? '<div class="alert info mt">You can mark students manually while the portal is live and for 1 hour after the OTP expires.</div>' : '';
+        : data.session ? '<div class="alert info mt">You can mark students manually while the portal is live and for 1 hour after it closes.</div>' : '');
+      const sa = $('#see-alerts');
+      if (sa) sa.onclick = () => { S.tab = 'reports'; S.secRange = '1d'; S.scrollToSecurity = true; render(); };
     };
 
     const drawList = () => {
@@ -937,7 +1072,7 @@
           <div class="avatar ${s.marked ? 'ok' : ''}">${s.marked ? I.check.replace('<svg', '<svg style="width:18px"') : esc(initials(s.name))}</div>
           <div class="li-main"><div class="t">${esc(s.name)}</div><div class="s">${esc(s.enroll)} · ${esc(s.stop)}${s.pct30 !== null ? ` · 30-day ${s.pct30}%` : ''}</div></div>
           <div class="li-side">${s.marked
-            ? `<span class="badge ${s.method === 'SELF' ? 'green' : 'orange'}">${s.method === 'SELF' ? 'Self' : 'Admin'} · ${esc(s.time)}</span>${s.method === 'ADMIN' ? `<span class="small muted">${esc(s.markedBy)}</span>` : ''}`
+            ? `<span class="badge ${s.method === 'SELF' ? 'green' : 'orange'}">${s.method === 'SELF' ? 'Self' : 'Admin'} · ${esc(s.time)}</span>${s.method === 'ADMIN' ? `<span class="small muted">${esc(s.markedBy)}</span>` : s.dist !== null ? `<span class="small muted">📍 ${s.dist} m from bus</span>` : ''}`
             : data.canManual ? `<button class="btn sm ghost" data-mark="${esc(s.enroll)}">Mark present</button>` : `<span class="badge gray">${data.working ? 'Absent' : '—'}</span>`}</div>
         </div>`).join('') : `<div class="empty">${I.users}<div>${data.total ? 'No students match.' : 'No students on this bus yet.'}</div></div>`;
       $$('[data-mark]').forEach((b) => (b.onclick = () => manualMark(b.dataset.mark)));
@@ -973,8 +1108,12 @@
       S.live.lastSessionId = sid;
       const badge = $('#chat-badge');
       if (badge) { badge.hidden = !data.unreadChats; badge.textContent = data.unreadChats; }
-      const nsig = JSON.stringify([sid, data.session && data.session.otp, data.session && data.session.expiresAt, data.trip, data.settings.otpMinutes]);
+      const bg = data.session && data.session.busGeo;
+      const nsig = JSON.stringify([sid, data.session && data.session.otp, data.session && data.session.expiresAt, data.trip, data.settings.otpMinutes, !!bg, bg && bg.stale]);
       if (nsig !== sig) { sig = nsig; drawOtp(); }
+      // The phone that opened the portal shares its GPS so the location check follows the bus.
+      if (data.session && data.session.requireGeo && data.session.createdByUser === data.me) startBusGps(bus);
+      else stopBusGps();
       drawProgress();
       drawList();
       $('#lv-upd').textContent = 'Live · ' + new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -995,7 +1134,7 @@
         <div class="toolbar"><input class="input" id="st-q" placeholder="Search name or enrollment">
           <select class="input" id="st-stop"><option value="">All stops</option>${d.stops.map((s) => `<option>${esc(s)}</option>`).join('')}</select></div>
         <div class="row-between mb"><span class="small muted">Attendance % over</span>${chips('sr', ['7d', '1m', '3m', '6m'], S.stuRange)}</div>
-        <div class="table-wrap"><table class="tbl"><thead><tr><th>#</th><th>Name</th><th>Enrollment</th><th>Course</th><th>Yr / Sem</th><th>Stop</th><th>Today</th><th>${RANGE_LABELS[d.range]} %</th>${d.canEdit ? '<th></th>' : ''}</tr></thead><tbody id="st-body"></tbody></table></div>
+        <div class="table-wrap"><table class="tbl"><thead><tr><th>#</th><th>Name</th><th>Enrollment</th><th>Course</th><th>Yr / Sem</th><th>Stop</th><th>Today</th><th>${RANGE_LABELS[d.range]} %</th><th>Phone</th>${d.canEdit ? '<th></th>' : ''}</tr></thead><tbody id="st-body"></tbody></table></div>
         <p class="small muted" style="margin:10px 0 0">${d.held} trips held in this period.${d.canEdit ? ' Changes appear on the student and admin portals within seconds.' : ' Only the Super Admin can add or remove students.'}</p>
       </div>`;
     const draw = () => {
@@ -1004,8 +1143,14 @@
       $('#st-body').innerHTML = list.length ? list.map((s, i) => `<tr><td>${i + 1}</td><td><b>${esc(s.name)}</b></td><td>${esc(s.enroll)}</td><td>${esc(s.course)}</td><td>${s.year ? s.year + ' / ' + s.semester : '—'}</td><td>${esc(s.stop)}</td>
         <td><span class="badge ${s.todayMorning ? 'green' : 'gray'}">M</span> <span class="badge ${s.todayEvening ? 'green' : 'gray'}">E</span></td>
         <td>${s.pct === null ? '—' : `<span class="badge ${s.pct >= 75 ? 'green' : s.pct >= 50 ? 'orange' : 'red'}">${s.pct}%</span>`}</td>
-        ${d.canEdit ? `<td><button class="btn sm outline" data-edit="${esc(s.enroll)}">Edit</button> <button class="btn sm red-o" data-rm="${esc(s.enroll)}">Remove</button></td>` : ''}</tr>`).join('') : '<tr><td colspan="9" class="center muted">No students</td></tr>';
+        <td>${s.phoneLinked ? `<span class="badge green" title="Linked ${esc(s.phoneLinkedAt ? when(s.phoneLinkedAt) : '')}">📱 Linked</span> <button class="btn sm outline" data-unlink="${esc(s.enroll)}" title="Reset if the student changed phones">Reset</button>` : '<span class="badge gray">Not yet</span>'}</td>
+        ${d.canEdit ? `<td><button class="btn sm outline" data-edit="${esc(s.enroll)}">Edit</button> <button class="btn sm red-o" data-rm="${esc(s.enroll)}">Remove</button></td>` : ''}</tr>`).join('') : '<tr><td colspan="10" class="center muted">No students</td></tr>';
       $$('[data-edit]').forEach((b) => (b.onclick = () => studentModal(d, d.students.find((x) => x.enroll === b.dataset.edit))));
+      $$('[data-unlink]').forEach((b) => (b.onclick = async () => {
+        const s = d.students.find((x) => x.enroll === b.dataset.unlink);
+        if (!(await confirmBox('Reset phone link?', `<b>${esc(s.name)}</b> will be able to mark from a new phone. The next phone they mark from becomes linked.`, 'Reset link'))) return;
+        try { await post('/api/admin/students/unlink-phone', { bus, enroll: s.enroll }); toast('Phone link reset', 'ok'); render(); } catch (e) { toast(e.message, 'err'); }
+      }));
       $$('[data-rm]').forEach((b) => (b.onclick = async () => {
         const s = d.students.find((x) => x.enroll === b.dataset.rm);
         if (!(await confirmBox('Remove student?', `<b>${esc(s.name)}</b> (${esc(s.enroll)}) will be removed from bus ${esc(bus)}. Their past attendance stays in reports.`, 'Remove', true))) return;
@@ -1067,7 +1212,9 @@
         <div class="btn-row"><button class="btn" id="rp-go">${I.chart} Show</button><button class="btn green" id="rp-xl">${I.download} Download Excel</button></div>
         <p class="small muted" style="margin:10px 0 0">The Excel sheet lists each student's name, the date and time, and who marked the attendance (the student with the OTP, or the admin by name). It also has a P/A register and a daily summary. Up to the last 6 months.</p>
       </div>
-      <div id="rp-out" class="mt"></div>`;
+      <div id="rp-out" class="mt"></div>
+      <div class="section-title mt" id="sec-title"><h2>🛡️ Security — blocked attempts</h2>${chips('secr', ['1d', '7d', '1m', '3m', '6m'], S.secRange)}</div>
+      <div id="sec-out"><div class="card"><p class="muted">Loading…</p></div></div>`;
     const DAYS = { '1d': 0, '7d': 6, '1m': 29, '3m': 89, '6m': 182 };
     const readR = () => { R.from = $('#rp-from').value; R.to = $('#rp-to').value; R.trip = $('#rp-trip').value; };
     $$('#rp-quick [data-k]').forEach((c) => (c.onclick = () => { $$('#rp-quick .chip').forEach((x) => x.classList.toggle('active', x === c)); $('#rp-to').value = today; $('#rp-from').value = addDays(today, -DAYS[c.dataset.k]); show(); }));
@@ -1093,6 +1240,24 @@
           </div>`;
       } catch (e) { out.innerHTML = `<div class="alert err">${esc(e.message)}</div>`; }
     };
+    const showSecurity = async () => {
+      const out = $('#sec-out');
+      try {
+        const d = await get(`/api/admin/security?${qs({ bus, range: S.secRange })}`);
+        if (!$('#sec-out')) return;
+        out.innerHTML = !d.total
+          ? `<div class="card empty">${I.shield}<div>No blocked attempts in the last ${RANGE_LABELS[d.range]}. 👍</div></div>`
+          : `<div class="grid stats">${Object.entries(d.byType).map(([k, n]) => `<div class="card stat red"><div class="k">${esc(d.labels[k] || k)}</div><div class="v">${n}</div></div>`).join('')}</div>
+            <div class="grid two mt">
+              <div class="card"><h3>Students with most blocked attempts</h3>${d.topStudents.map((t) => `<div class="list-item"><div class="avatar warn">${esc(initials(t.name || '?'))}</div><div class="li-main"><div class="t">${esc(t.name || 'Unknown')}</div><div class="s">${esc(t.enroll || '')} · ${Object.entries(t.types).map(([k, n]) => `${esc(d.labels[k] || k)} ×${n}`).join(', ')}</div></div><span class="badge red">${t.count}</span></div>`).join('')}</div>
+              <div class="card"><h3>Recent events</h3><div class="table-wrap" style="max-height:380px"><table class="tbl"><thead><tr><th>When</th><th>Student</th><th>Event</th><th>Details</th></tr></thead><tbody>${d.events.map((e) => `<tr><td>${esc(when(e.at))}</td><td><b>${esc(e.name || '')}</b><br><span class="small muted">${esc(e.enroll || '')}</span></td><td><span class="badge red">${esc(e.label)}</span></td><td style="white-space:normal;min-width:220px">${esc(e.detail || '')}</td></tr>`).join('')}</tbody></table></div></div>
+            </div>
+            <p class="small muted">These attempts were blocked automatically; nothing was marked. They are also included in the Excel download (Security Events sheet).</p>`;
+        if (S.scrollToSecurity) { S.scrollToSecurity = false; $('#sec-title').scrollIntoView({ behavior: 'smooth' }); }
+      } catch (e) { out.innerHTML = `<div class="alert err">${esc(e.message)}</div>`; }
+    };
+    bindChips('secr', (v) => { S.secRange = v; showSecurity(); });
+    showSecurity();
     $('#rp-go').onclick = show;
     $('#rp-xl').onclick = async (e) => {
       readR();
@@ -1219,8 +1384,11 @@
     view.innerHTML = `
       <div class="grid two">
         <div>
-          <div class="card"><h2>Default OTP validity</h2><p class="sub">Pre-filled each time the portal is made live on ${esc(bus)} (you can still change it then).</p>
-            <form id="set-form" class="row" style="align-items:flex-end;flex-wrap:nowrap"><label class="field" style="margin:0"><span>Minutes (1–240)</span><input class="input" type="number" min="1" max="240" name="m" id="set-m"></label><button class="btn" style="flex:0 0 auto">Save</button></form>
+          <div class="card"><h2>Portal defaults · ${esc(bus)}</h2><p class="sub">Pre-filled each time the portal is made live (you can still change the time then).</p>
+            <form id="set-form" class="row" style="align-items:flex-end"><label class="field" style="margin:0"><span>Open for (minutes, 1–240)</span><input class="input" type="number" min="1" max="240" id="set-m"></label>
+              <label class="field" style="margin:0"><span>📍 Location radius (metres, 50–2000)</span><input class="input" type="number" min="50" max="2000" step="10" id="set-r"></label>
+              <button class="btn" style="flex:0 0 auto">Save</button></form>
+            <p class="small muted" style="margin:8px 0 0">The radius is measured from the phone that opened the portal. GPS inside a bus is usually accurate to 10–50 m; the app adds both phones' GPS accuracy on top of the radius.</p>
             <div class="hr"></div>
             <h3>Rules</h3>
             <ul class="small muted rules">
@@ -1235,14 +1403,16 @@
         <div class="card"><h2>Activity log</h2><p class="sub">OTP generation, manual marks, exports and changes.</p><div id="audit" class="list" style="max-height:640px;overflow:auto"><p class="muted">Loading…</p></div></div>
       </div>
       ${sup ? `<div class="section-title mt"><h2>Administrative admins &amp; coordinators</h2><button class="btn sm" id="sf-add">${I.plus} Add account</button></div><div class="card"><div id="staff" class="table-wrap"></div></div>
+      <div class="section-title mt"><h2>Data &amp; backups</h2><button class="btn sm green" id="bk-dl">${I.download} Download full backup</button></div>
+      <div class="card" id="sys-info"><p class="muted">Loading…</p></div>
       <div class="section-title mt"><h2>E-mail for password-reset OTPs</h2></div>
       <div class="card"><p class="sub">Use an SMTP account, e.g. a Gmail address with an <i>App password</i> (host smtp.gmail.com, port 465). Until this is set, reset OTPs are printed in the server console.</p>
         <form id="smtp-form"><div class="row"><label class="field"><span>SMTP host</span><input class="input" name="host" placeholder="smtp.gmail.com"></label><label class="field" style="max-width:120px"><span>Port</span><input class="input" name="port" type="number" value="465"></label></div>
         <div class="row"><label class="field"><span>Username / e-mail</span><input class="input" name="user" autocomplete="off"></label><label class="field"><span>Password / app password</span><input class="input" name="pass" type="password" autocomplete="new-password"></label></div>
         <div class="row"><label class="field"><span>From (optional)</span><input class="input" name="from" placeholder="UU Transport <transport@example.com>"></label><label class="field"><span>Send a test e-mail to (optional)</span><input class="input" name="testTo" type="email"></label></div>
         <button class="btn">${I.mail} Save e-mail settings</button></form></div>` : ''}`;
-    get(`/api/admin/live?bus=${encodeURIComponent(bus)}`).then((d) => { const i = $('#set-m'); if (i) i.value = d.settings.otpMinutes; }).catch(() => {});
-    $('#set-form').onsubmit = async (e) => { e.preventDefault(); try { await busy(e.target.querySelector('.btn'), () => post('/api/admin/settings', { bus, otpMinutes: Number($('#set-m').value) })); toast('Saved', 'ok'); } catch (err) { toast(err.message, 'err'); } };
+    get(`/api/admin/live?bus=${encodeURIComponent(bus)}`).then((d) => { const i = $('#set-m'); if (i) { i.value = d.settings.otpMinutes; $('#set-r').value = d.settings.geoRadius; } }).catch(() => {});
+    $('#set-form').onsubmit = async (e) => { e.preventDefault(); try { await busy(e.target.querySelector('.btn'), () => post('/api/admin/settings', { bus, otpMinutes: Number($('#set-m').value), geoRadius: Number($('#set-r').value) })); toast('Saved', 'ok'); } catch (err) { toast(err.message, 'err'); } };
     accountView($('#acct'));
     $('#acct .acct-head').remove();
     $('#acct .acct-body').classList.remove('mt');
@@ -1251,6 +1421,31 @@
       a.innerHTML = d.audit.length ? d.audit.map((x) => `<div class="list-item"><div class="li-main"><div class="t" style="white-space:normal;font-size:13.5px">${esc(x.action.replace(/-/g, ' '))}${x.detail ? ' — <span class="muted" style="font-weight:400">' + esc(x.detail) + '</span>' : ''}</div><div class="s">${esc(x.user)} · ${esc(when(x.at))}</div></div></div>`).join('') : '<p class="muted">No activity yet.</p>';
     }).catch((e) => { const a = $('#audit'); if (a) a.innerHTML = `<div class="alert err">${esc(e.message)}</div>`; });
     if (!sup) return;
+    get('/api/super/system').then((d) => {
+      const el = $('#sys-info'); if (!el) return;
+      el.innerHTML = `<div class="grid stats">
+          <div class="stat blue card flat"><div class="k">Storage</div><div class="v" style="font-size:18px">${esc(d.storage)}</div></div>
+          <div class="stat green card flat"><div class="k">Attendance records</div><div class="v">${d.records}</div></div>
+          <div class="stat card flat"><div class="k">Active students</div><div class="v">${d.students}</div></div>
+          <div class="stat orange card flat"><div class="k">Last automatic backup</div><div class="v" style="font-size:18px">${esc(d.lastBackupDate || '—')}</div></div>
+        </div>
+        ${d.lastSaveError ? `<div class="alert err mt">Last save failed: ${esc(d.lastSaveError)} (the server keeps retrying).</div>` : '<p class="small muted" style="margin:10px 0 0">Data is saved within a second of every change, and a dated backup copy is kept automatically each day (last 30 days).</p>'}
+        ${d.backups.length ? `<p class="small muted" style="margin:6px 0 0">Daily copies on the server: ${d.backups.map((b) => esc(b.name.replace(/^db-|\.json$/g, ''))).join(', ')}</p>` : ''}`;
+    }).catch(() => {});
+    $('#bk-dl').onclick = async (e) => {
+      await busy(e.currentTarget, async () => {
+        try {
+          const res = await fetch('/api/super/backup', { headers: { Authorization: 'Bearer ' + S.token } });
+          if (!res.ok) throw new Error('Backup failed');
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(await res.blob());
+          a.download = `uu-bus-backup-${todayIST()}.json`;
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+          toast('Backup downloaded — keep it somewhere safe', 'ok');
+        } catch (err) { toast(err.message, 'err'); }
+      });
+    };
     const loadStaff = async () => {
       const { staff } = await get('/api/super/staff');
       $('#staff').innerHTML = `<table class="tbl"><thead><tr><th>Role</th><th>Name</th><th>Login ID</th><th>Bus</th><th>Phone</th><th>E-mail</th><th>Status</th><th></th></tr></thead><tbody>${staff.filter((s) => s.role !== 'super').map((s) => `<tr><td>${esc(s.title)}</td><td><b>${esc(s.name)}</b></td><td>${esc(s.username)}</td><td>${s.bus === '*' ? 'All' : esc(s.bus)}</td><td>${esc(s.phone)}</td><td>${esc(s.email) || '<span class="muted">—</span>'}</td><td>${s.active ? '<span class="badge green">Active</span>' : '<span class="badge gray">Disabled</span>'}</td><td><button class="btn sm outline" data-sf="${esc(s.username)}">Edit</button></td></tr>`).join('')}</tbody></table>`;
@@ -1319,7 +1514,13 @@
     if (S.token) {
       try { const r = await get('/api/me'); S.user = r.user; } catch { S.token = null; store.del('token'); }
     }
-    const wait = Math.max(0, 1600 - (Date.now() - started));
+    // Opened from a scanned QR: go straight to the student's portal (or name list for that bus).
+    if (deepLink && /^UU-\d{1,2}$/.test(deepLink.bus)) {
+      S.fromQR = !!S.pendingCode;
+      if (S.me && S.me.bus === deepLink.bus) Object.assign(S, { view: 'student', tab: 'attend' });
+      else Object.assign(S, { view: 'pick', bus: deepLink.bus });
+    }
+    const wait = Math.max(0, (deepLink ? 600 : 1600) - (Date.now() - started));
     setTimeout(() => {
       render();
       $('#splash').classList.add('hide');

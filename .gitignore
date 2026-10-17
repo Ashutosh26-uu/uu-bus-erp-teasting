@@ -11,3 +11,7 @@ lib/seed.private.js
 # Local tooling
 .claude/
 *.log
+
+# Zoho Catalyst build output and local CLI link
+catalyst-build/
+.catalystrc

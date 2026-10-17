@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test-email": "node scripts/test-email.js"
+    "test-email": "node scripts/test-email.js",
+    "build:catalyst": "node scripts/build-catalyst.js"
   },
   "engines": {
     "node": ">=22"

@@ -459,3 +459,14 @@ button.list-item:hover { background: var(--surface-2); }
 .btn.wa:hover { filter: brightness(1.05); }
 .btn.wa svg { width: 18px; height: 18px; }
 .otp-display .share-row { margin-top: 10px; }
+
+/* rotating QR code */
+.qr-wrap { position: relative; z-index: 1; display: flex; justify-content: center; margin: 10px 0 4px; }
+.qr-box { width: min(240px, 70vw); aspect-ratio: 1; background: #fff; border-radius: 16px; padding: 10px; display: grid; place-items: center; color: #333; box-shadow: 0 8px 24px rgba(0,0,0,.25); }
+.qr-box svg { width: 100%; height: 100%; display: block; }
+.otp-display.rotating .otp-digits { font-size: 38px; letter-spacing: 10px; margin-top: 4px; }
+.code-cycle { position: relative; z-index: 1; max-width: 260px; margin: 0 auto 10px; font-size: 13px; opacity: .95; }
+.code-cycle .timer-bar { height: 4px; margin-top: 4px; }
+.code-cycle .timer-bar i { background: #fff; transition: width 1s linear; }
+.geo-line { position: relative; z-index: 1; margin-top: 10px; font-size: 13px; background: rgba(255,255,255,.14); border-radius: 999px; padding: 5px 12px; display: inline-block; }
+.geo-line.warn { background: rgba(247,148,29,.9); color: #1d1300; font-weight: 600; }

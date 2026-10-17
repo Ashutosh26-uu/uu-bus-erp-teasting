@@ -10,17 +10,18 @@ const { sendMail } = require('./lib/mailer');
 const { externalSmtp, explainSmtpError } = require('./lib/smtp-config');
 const seed = require('./lib/seed');
 
-const PORT = Number(process.env.PORT) || 3000;
+// Zoho Catalyst AppSail provides its port in X_ZOHO_CATALYST_LISTEN_PORT.
+const PORT = Number(process.env.X_ZOHO_CATALYST_LISTEN_PORT || process.env.PORT) || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-const DB_FILE = path.join(DATA_DIR, 'db.json');
-const VOICE_DIR = path.join(DATA_DIR, 'voice');
-const CRED_FILE = path.join(DATA_DIR, 'initial-credentials.txt');
+const store = require('./lib/store').createStore(DATA_DIR);
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const TZ = 'Asia/Kolkata';
 const TOKEN_TTL_MS = 12 * 60 * 60 * 1000;
 const MANUAL_WINDOW_MS = 60 * 60 * 1000; // admins may mark manually up to 1 hour after the OTP closes
 const MAX_OTP_ATTEMPTS = 5;
 const MAX_OTP_MINUTES = 240;
+const CODE_WINDOW_SEC = 30; // rotating QR code changes every 30 s
+const BUS_GPS_STALE_MS = 3 * 60 * 1000;
 const TRIPS = ['Morning', 'Evening'];
 const BUSES = Array.from({ length: 21 }, (_, i) => `UU-${i + 1}`);
 const RANGES = { '1d': 1, '7d': 7, '1m': 30, '3m': 90, '6m': 180 };
@@ -167,39 +168,64 @@ function createDb() {
     ...creds.map((c) => `${c.title.padEnd(28)} ${c.name.padEnd(46)} ID: ${c.username.padEnd(10)} Password: ${c.password}`),
     '',
   ];
-  fs.writeFileSync(CRED_FILE, lines.join('\n'));
+  pendingCredentials = lines.join('\n');
   console.log('\n' + lines.join('\n'));
   return data;
 }
-function loadDb() {
-  fs.mkdirSync(VOICE_DIR, { recursive: true });
-  if (fs.existsSync(DB_FILE)) {
-    db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+let pendingCredentials = null;
+// Fields added after the first release — filled in so older databases keep working.
+function migrate(d) {
+  d.events = d.events || [];
+  for (const b of BUSES) d.settings[b] = { otpMinutes: 10, geoRadius: 200, ...(d.settings[b] || {}) };
+  return d;
+}
+async function loadDb() {
+  await store.init();
+  const text = await store.loadDb();
+  if (text) {
+    db = JSON.parse(text);
     if (db.version !== 2) {
-      const bak = DB_FILE.replace(/\.json$/, `.v${db.version || 1}.bak.json`);
-      fs.renameSync(DB_FILE, bak);
-      console.log('Old database format moved to', bak);
+      await store.moveAside(`v${db.version || 1}.bak`);
+      console.log('Old database format set aside; creating a new one.');
       db = createDb();
-      saveNow();
     }
   } else {
     db = createDb();
-    saveNow();
-    console.log('Created new database at', DB_FILE);
+    console.log(`Created a new database (${store.name}).`);
   }
+  migrate(db);
+  if (pendingCredentials) { await store.writeCredentials(pendingCredentials); pendingCredentials = null; }
+  await saveNow();
 }
 let saveTimer = null;
+let saving = Promise.resolve();
+let lastBackupDate = null;
+let lastSaveError = null;
+function snapshot() {
+  return JSON.stringify(db);
+}
 function saveNow() {
-  const tmp = DB_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(db));
-  fs.renameSync(tmp, DB_FILE);
+  const text = snapshot();
+  saving = saving.then(async () => {
+    try {
+      await store.saveDb(text);
+      lastSaveError = null;
+      const today = fmtDate();
+      if (lastBackupDate !== today && (await store.backup(text, today)) !== null) lastBackupDate = today;
+    } catch (e) {
+      lastSaveError = e.message;
+      console.error('DB save failed:', e.message);
+      save(); // retry shortly
+    }
+  });
+  return saving;
 }
 function save() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    try { saveNow(); } catch (e) { console.error('DB save failed', e); }
-  }, 200);
+    saveNow();
+  }, 300);
 }
 
 // Public-facing name: the super admin's real name is never exposed.
@@ -295,6 +321,52 @@ function workingSession(bus) {
 const genOtp = () => String(crypto.randomInt(0, 1000000)).padStart(6, '0');
 const findRecord = (enroll, date, trip) => db.attendance.find((a) => a.enroll === enroll && a.date === date && a.trip === trip);
 const busStudents = (bus) => db.students.filter((s) => s.bus === bus && s.active !== false);
+
+// Rotating code: HMAC of the session secret and the current 30-second window (like an authenticator app).
+const codeWindow = (t = Date.now()) => Math.floor(t / (CODE_WINDOW_SEC * 1000));
+function rotatingCode(secret, win) {
+  const h = crypto.createHmac('sha256', secret).update(String(win)).digest();
+  return String(h.readUInt32BE(0) % 1000000).padStart(6, '0');
+}
+function currentCode(s) {
+  if (s.mode !== 'rotating') return s.otp;
+  return rotatingCode(s.secret, codeWindow());
+}
+function codeMatches(s, code) {
+  if (s.mode !== 'rotating') return code === s.otp;
+  const w = codeWindow();
+  // accept the current and the previous window, so a code read just before it changes still works
+  return [w, w - 1].some((x) => rotatingCode(s.secret, x) === code);
+}
+
+// Great-circle distance in metres.
+function distanceM(a, b) {
+  const R = 6371000, rad = (d) => (d * Math.PI) / 180;
+  const dLat = rad(b.lat - a.lat), dLng = rad(b.lng - a.lng);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return Math.round(2 * R * Math.asin(Math.sqrt(h)));
+}
+function readGeo(body) {
+  const lat = Number(body.lat), lng = Number(body.lng), acc = Number(body.acc);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+  return { lat, lng, acc: Number.isFinite(acc) && acc > 0 ? Math.min(Math.round(acc), 5000) : 50, at: new Date().toISOString() };
+}
+
+// Suspicious / blocked attempts, shown to admins under Reports → Security.
+const EVENT_LABELS = {
+  wrong_code: 'Wrong OTP / code',
+  locked_out: 'Locked out (too many wrong codes)',
+  too_far: 'Too far from the bus',
+  no_location: 'Location not shared',
+  phone_mismatch: 'Name is linked to another phone',
+  phone_reused: 'Phone already used for another student',
+};
+function securityEvent(type, st, s, detail, ctx = {}) {
+  db.events.push({ id: uid(6), at: new Date().toISOString(), date: fmtDate(), bus: st?.bus || s?.bus, enroll: st?.enroll, name: st?.name, type, detail, sessionId: s?.id, trip: s?.trip, ip: ctx.ip, device: (ctx.deviceId || '').slice(0, 12) });
+  if (db.events.length > 20000) db.events.splice(0, db.events.length - 20000);
+  save();
+}
+
 function sessionView(s, withOtp) {
   if (!s) return null;
   const v = {
@@ -302,8 +374,17 @@ function sessionView(s, withOtp) {
     createdAt: s.createdAt, expiresAt: s.expiresAt, closedAt: s.closedAt || null,
     open: !s.closedAt && new Date(s.expiresAt).getTime() > Date.now(),
     manualUntil: new Date(manualUntil(s)).toISOString(), serverNow: new Date().toISOString(),
+    mode: s.mode || 'fixed', requireGeo: !!s.requireGeo, geoRadius: s.geoRadius || null,
   };
-  if (withOtp) v.otp = s.otp;
+  if (withOtp) {
+    v.otp = currentCode(s);
+    if (s.mode === 'rotating') {
+      const w = codeWindow();
+      v.codeWindowEnds = new Date((w + 1) * CODE_WINDOW_SEC * 1000).toISOString();
+      v.codeWindowSec = CODE_WINDOW_SEC;
+    }
+    v.busGeo = s.geo ? { lat: s.geo.lat, lng: s.geo.lng, acc: s.geo.acc, at: s.geo.at, stale: Date.now() - new Date(s.geo.at).getTime() > BUS_GPS_STALE_MS } : null;
+  }
   return v;
 }
 const heldKeys = (bus, from, to) => {
@@ -367,7 +448,7 @@ function serveStatic(req, res, pathname) {
 const routes = {};
 const route = (method, p, fn, opts = {}) => (routes[`${method} ${p}`] = { fn, ...opts });
 
-route('GET', '/api/health', (req, res) => ok(res, { ok: true, time: new Date().toISOString() }));
+route('GET', '/api/health', (req, res) => ok(res, { ok: true, time: new Date().toISOString(), storage: store.name, lastSaveError }));
 
 // ======== PUBLIC (students — no login) ========
 route('GET', '/api/public/home', (req, res) => {
@@ -404,47 +485,81 @@ route('GET', '/api/public/student', (req, res, { query }) => {
   }
   const todayRecs = db.attendance.filter((a) => a.enroll === st.enroll && a.date === today).map((a) => ({ trip: a.trip, time: a.time, method: a.method }));
   const unread = db.chats.filter((c) => c.enroll === st.enroll && c.from === 'staff' && !c.readByStudent).length;
+  const deviceId = clean(query.deviceId, 80);
+  const phone = !st.deviceId ? 'none' : st.deviceId === deviceId ? 'this' : 'other';
   ok(res, {
     student: studentCard(st),
     session: open ? { ...sessionView(open, false), alreadyMarked: !!findRecord(st.enroll, open.date, open.trip), attemptsLeft: MAX_OTP_ATTEMPTS - ((open.attempts || {})[st.enroll] || 0) } : null,
-    current, today, todayRecords: todayRecs, unreadChats: unread, serverNow: new Date().toISOString(),
+    current, today, todayRecords: todayRecs, unreadChats: unread, phone, serverNow: new Date().toISOString(),
   });
 });
 
+// Student marks own attendance. Checks, in order: portal open → not already marked → attempts left →
+// correct code → near the bus (if location check is on) → phone lock. Every blocked attempt is logged.
 route('POST', '/api/public/mark', (req, res, { body, ip }) => {
   const st = publicStudent({ enroll: body.enroll, bus: body.bus }, res);
   if (!st) return;
   const s = activeSession(st.bus);
-  if (!s) return fail(res, 409, 'Attendance portal is closed. Wait for the bus incharge to share the OTP.');
+  if (!s) return fail(res, 409, 'Attendance portal is closed. Wait for the bus incharge to share the code.');
   if (findRecord(st.enroll, s.date, s.trip)) return fail(res, 409, `Already marked for the ${s.trip} trip today.`);
+  const deviceId = clean(body.deviceId, 80) || 'unknown';
+  const ctx = { ip, deviceId };
   s.attempts = s.attempts || {};
   s.ipFails = s.ipFails || {};
   const used = s.attempts[st.enroll] || 0;
-  if (used >= MAX_OTP_ATTEMPTS) return fail(res, 429, 'Too many wrong OTP attempts. Ask the bus incharge to mark you manually.');
-  if ((s.ipFails[ip] || 0) >= 15) return fail(res, 429, 'Too many wrong OTP attempts from this network.');
-  const otp = String(body.otp || '').replace(/\D/g, '');
-  if (otp !== s.otp) {
+  if (used >= MAX_OTP_ATTEMPTS) return fail(res, 429, 'Too many wrong attempts. Ask the bus incharge to mark you manually.');
+  if ((s.ipFails[ip] || 0) >= 15) return fail(res, 429, 'Too many wrong attempts from this network.');
+
+  const code = String(body.otp || '').replace(/\D/g, '');
+  if (!codeMatches(s, code)) {
     s.attempts[st.enroll] = used + 1;
     s.ipFails[ip] = (s.ipFails[ip] || 0) + 1;
-    save();
     const left = MAX_OTP_ATTEMPTS - used - 1;
-    return fail(res, 400, `Wrong OTP. ${left} attempt${left === 1 ? '' : 's'} left.`);
+    securityEvent(left <= 0 ? 'locked_out' : 'wrong_code', st, s, `Entered ${code || '(blank)'}`, ctx);
+    const hint = s.mode === 'rotating' ? ' The code changes every 30 seconds — scan the QR or read the latest code.' : '';
+    return fail(res, 400, `Wrong code. ${left} attempt${left === 1 ? '' : 's'} left.${hint}`);
   }
-  const deviceId = clean(body.deviceId, 80) || 'unknown';
-  s.devices = s.devices || {};
-  if (deviceId !== 'unknown' && s.devices[deviceId] && s.devices[deviceId] !== st.enroll) {
-    audit(null, 'proxy-blocked', `${st.name} (${st.enroll}) tried on a phone already used by ${s.devices[deviceId]}`, st.bus);
-    save();
-    return fail(res, 403, 'This phone has already marked another student for this trip. Each student must use their own phone.');
+
+  let dist = null;
+  const geo = readGeo(body);
+  if (s.requireGeo && s.geo) {
+    if (!geo) {
+      securityEvent('no_location', st, s, 'Correct code but location was not shared', ctx);
+      return fail(res, 403, 'Location is required to mark attendance. Allow location access for this site and try again.', { code: 'NEED_LOCATION' });
+    }
+    dist = distanceM(geo, s.geo);
+    // allowance = radius + GPS uncertainty of both phones (capped so a vague fix can't stretch it too far)
+    const allowed = (s.geoRadius || 200) + Math.min(geo.acc, 150) + Math.min(s.geo.acc, 150);
+    if (dist > allowed) {
+      securityEvent('too_far', st, s, `Correct code but ${dist} m from the bus (allowed ${allowed} m, GPS ±${geo.acc} m)`, ctx);
+      return fail(res, 403, `You seem to be about ${dist >= 1000 ? (dist / 1000).toFixed(1) + ' km' : dist + ' m'} away from the bus. Attendance can only be marked inside the bus.`, { code: 'TOO_FAR' });
+    }
   }
-  s.devices[deviceId] = st.enroll;
+
+  if (deviceId !== 'unknown') {
+    if (st.deviceId && st.deviceId !== deviceId) {
+      securityEvent('phone_mismatch', st, s, 'Correct code from a phone not linked to this student', ctx);
+      return fail(res, 403, 'Your name is linked to a different phone. If you changed phones, ask your bus incharge to reset the phone link.', { code: 'PHONE_MISMATCH' });
+    }
+    const owner = db.students.find((x) => x.deviceId === deviceId && x.enroll !== st.enroll && x.active !== false);
+    s.devices = s.devices || {};
+    const sameTrip = s.devices[deviceId] && s.devices[deviceId] !== st.enroll;
+    if (owner || sameTrip) {
+      securityEvent('phone_reused', st, s, `Phone is linked to ${owner ? owner.name + ' (' + owner.enroll + ')' : s.devices[deviceId]}`, ctx);
+      return fail(res, 403, 'This phone is linked to another student. Each student must mark from their own phone.', { code: 'PHONE_REUSED' });
+    }
+    s.devices[deviceId] = st.enroll;
+    if (!st.deviceId) { st.deviceId = deviceId; st.deviceLinkedAt = new Date().toISOString(); }
+  }
+
   const now = new Date();
   db.attendance.push({
     id: uid(8), sessionId: s.id, bus: st.bus, enroll: st.enroll, date: s.date, trip: s.trip,
     time: fmtTime(now), at: now.toISOString(), method: 'SELF', markedBy: st.name, device: deviceId.slice(0, 12), ip,
+    lat: geo?.lat, lng: geo?.lng, acc: geo?.acc, dist,
   });
   save();
-  ok(res, { ok: true, record: { trip: s.trip, date: s.date, time: fmtTime(now) } });
+  ok(res, { ok: true, record: { trip: s.trip, date: s.date, time: fmtTime(now), dist } });
 });
 
 route('GET', '/api/public/history', (req, res, { query }) => {
@@ -493,7 +608,7 @@ route('GET', '/api/public/chat', (req, res, { query }) => {
   ok(res, { messages: msgs.slice(-200).map(chatView) });
 });
 const VOICE_TYPES = { 'audio/webm': 'webm', 'audio/ogg': 'ogg', 'audio/mp4': 'm4a', 'audio/mpeg': 'mp3', 'audio/aac': 'aac', 'audio/wav': 'wav' };
-route('POST', '/api/public/chat', (req, res, { body, ip }) => {
+route('POST', '/api/public/chat', async (req, res, { body, ip }) => {
   const st = publicStudent({ enroll: body.enroll, bus: body.bus }, res);
   if (!st) return;
   if (limited(`chat|${st.enroll}`, 20, 10 * 60 * 1000) || limited(`chatip|${ip}`, 60, 10 * 60 * 1000)) return fail(res, 429, 'You are sending messages too quickly. Please wait a few minutes.');
@@ -506,7 +621,7 @@ route('POST', '/api/public/chat', (req, res, { body, ip }) => {
     if (buf.length < 200) return fail(res, 400, 'Voice message is empty');
     if (buf.length > 3 * 1024 * 1024) return fail(res, 400, 'Voice message too long (max ~2 minutes)');
     const voiceId = uid(12);
-    fs.writeFileSync(path.join(VOICE_DIR, `${voiceId}.${ext}`), buf);
+    await store.putVoice(`${voiceId}.${ext}`, buf);
     Object.assign(msg, { type: 'voice', voiceId, voiceExt: ext, voiceMime: mime, duration: Math.min(300, Math.max(0, Math.round(Number(body.duration) || 0))) });
   } else {
     const text = clean(body.text, 1000);
@@ -573,7 +688,7 @@ route('POST', '/api/me/email', (req, res, { auth, body }) => {
 
 // ----- forgot password: OTP by e-mail -----
 // Effective SMTP settings: env vars / smtp.config.json win over the settings screen.
-const smtpConfig = () => externalSmtp() || { ...(db.smtp || {}), source: 'settings screen' };
+const smtpConfig = () => externalSmtp() || { ...((db && db.smtp) || {}), source: 'settings screen' };
 
 async function deliverOtp(acc, otp) {
   const cfg = smtpConfig();
@@ -677,15 +792,17 @@ route('GET', '/api/admin/live', (req, res, { auth, query }) => {
     return {
       enroll: st.enroll, name: st.name, stop: st.stop, course: academicInfo(st).course,
       marked: !!rec, time: rec?.time || null, method: rec?.method || null, markedBy: rec?.markedBy || null,
+      dist: rec?.dist ?? null, phoneLinked: !!st.deviceId,
       pct30: held ? Math.round(((counts[st.enroll] || 0) / held) * 100) : null,
     };
   });
   const unread = db.chats.filter((c) => c.bus === bus && c.from === 'student' && !c.readByStaff).length;
+  const alerts = ctx ? db.events.filter((e) => e.sessionId === ctx.id).length : 0;
   ok(res, {
     session: sessionView(open, true), working: sessionView(ctx, false),
     canManual: !!ctx && Date.now() <= manualUntil(ctx),
     date, trip, students: list, marked: list.filter((x) => x.marked).length, total: list.length,
-    settings: db.settings[bus] || { otpMinutes: 10 }, unreadChats: unread, me: auth.acc.username,
+    settings: db.settings[bus], unreadChats: unread, alerts, me: auth.acc.username,
   });
 });
 
@@ -700,17 +817,37 @@ route('POST', '/api/admin/session/start', (req, res, { auth, body }) => {
   const trip = TRIPS.includes(body.trip) ? body.trip : defaultTrip();
   let minutes = Math.round(Number(body.minutes) || db.settings[bus]?.otpMinutes || 10);
   minutes = Math.min(MAX_OTP_MINUTES, Math.max(1, minutes));
+  const mode = body.mode === 'fixed' ? 'fixed' : 'rotating';
+  const requireGeo = !!body.requireGeo;
+  const geo = readGeo(body);
+  if (requireGeo && !geo) return fail(res, 400, 'Your location is needed for the location check. Allow location access, or turn the location check off.', { code: 'NEED_LOCATION' });
   const now = new Date();
   const s = {
-    id: uid(8), bus, trip, date: fmtDate(now), otp: genOtp(),
+    id: uid(8), bus, trip, date: fmtDate(now), mode, otp: genOtp(), secret: uid(16),
+    requireGeo, geo: requireGeo ? geo : null, geoRadius: db.settings[bus].geoRadius,
     createdBy: auth.acc.username, createdByName: displayWho(auth.acc), createdByRole: auth.role,
     createdAt: now.toISOString(), expiresAt: new Date(now.getTime() + minutes * 60000).toISOString(),
     closedAt: null, attempts: {}, devices: {}, ipFails: {},
   };
   db.sessions.push(s);
-  audit(auth.acc, 'otp-generate', `${trip} trip, OTP valid ${minutes} min`, bus);
+  audit(auth.acc, 'otp-generate', `${trip} trip, ${mode === 'rotating' ? 'rotating QR code' : 'fixed OTP'}, valid ${minutes} min${requireGeo ? `, location check ${s.geoRadius} m` : ''}`, bus);
   save();
   ok(res, { session: sessionView(s, true) });
+});
+
+// The phone that opened the portal keeps sending its location so the geofence follows the moving bus.
+route('POST', '/api/admin/session/location', (req, res, { auth, body }) => {
+  const bus = body.bus;
+  if (!requireAdmin(auth, res, bus)) return;
+  const s = activeSession(bus);
+  if (!s) return fail(res, 409, 'No open attendance portal.');
+  if (!s.requireGeo) return ok(res, { ignored: true });
+  if (s.createdBy !== auth.acc.username) return ok(res, { ignored: true, reason: 'Only the phone that opened the portal updates the bus location.' });
+  const geo = readGeo(body);
+  if (!geo) return fail(res, 400, 'Invalid location');
+  s.geo = geo;
+  save();
+  ok(res, { ok: true });
 });
 
 route('POST', '/api/admin/session/extend', (req, res, { auth, body }) => {
@@ -730,7 +867,8 @@ route('POST', '/api/admin/session/regenerate', (req, res, { auth, body }) => {
   const s = activeSession(bus);
   if (!s) return fail(res, 409, 'No open attendance portal.');
   s.otp = genOtp();
-  audit(auth.acc, 'otp-regenerate', 'New OTP for the open portal', bus);
+  s.secret = uid(16);
+  audit(auth.acc, 'otp-regenerate', 'New code for the open portal', bus);
   save();
   ok(res, { session: sessionView(s, true) });
 });
@@ -748,10 +886,12 @@ route('POST', '/api/admin/session/close', (req, res, { auth, body }) => {
 route('POST', '/api/admin/settings', (req, res, { auth, body }) => {
   const bus = body.bus;
   if (!requireAdmin(auth, res, bus)) return;
-  const m = Math.round(Number(body.otpMinutes));
+  const m = Math.round(Number(body.otpMinutes ?? db.settings[bus].otpMinutes));
   if (!(m >= 1 && m <= MAX_OTP_MINUTES)) return fail(res, 400, `OTP validity must be between 1 and ${MAX_OTP_MINUTES} minutes.`);
-  db.settings[bus] = { ...(db.settings[bus] || {}), otpMinutes: m };
-  audit(auth.acc, 'settings', `Default OTP validity ${m} min`, bus);
+  const r = Math.round(Number(body.geoRadius ?? db.settings[bus].geoRadius));
+  if (!(r >= 50 && r <= 2000)) return fail(res, 400, 'Location radius must be between 50 and 2000 metres.');
+  db.settings[bus] = { ...db.settings[bus], otpMinutes: m, geoRadius: r };
+  audit(auth.acc, 'settings', `Default OTP validity ${m} min, location radius ${r} m`, bus);
   save();
   ok(res, { settings: db.settings[bus] });
 });
@@ -793,7 +933,45 @@ route('GET', '/api/admin/students', (req, res, { auth, query }) => {
       ...studentCard(s), present: counts[s.enroll] || 0,
       pct: held ? Math.round(((counts[s.enroll] || 0) / held) * 100) : null,
       todayMorning: !!findRecord(s.enroll, today, 'Morning'), todayEvening: !!findRecord(s.enroll, today, 'Evening'),
+      phoneLinked: !!s.deviceId, phoneLinkedAt: s.deviceLinkedAt || null,
     })),
+  });
+});
+
+// Reset a student's phone link (e.g. they changed phones). The next phone they mark from becomes linked.
+route('POST', '/api/admin/students/unlink-phone', (req, res, { auth, body }) => {
+  const bus = body.bus;
+  if (!requireAdmin(auth, res, bus)) return;
+  const st = db.students.find((s) => s.enroll === body.enroll && s.bus === bus);
+  if (!st) return fail(res, 404, 'Student not found on this bus.');
+  if (!st.deviceId) return fail(res, 409, `${st.name} has no linked phone.`);
+  delete st.deviceId;
+  delete st.deviceLinkedAt;
+  audit(auth.acc, 'phone-unlink', `${st.name} (${st.enroll}) — phone link reset`, bus);
+  save();
+  ok(res);
+});
+
+// Blocked / suspicious attempts for a bus, with per-student and per-type totals.
+function securityRows(bus, from, to) {
+  return db.events.filter((e) => e.bus === bus && e.date >= from && e.date <= to).sort((a, b) => b.at.localeCompare(a.at));
+}
+route('GET', '/api/admin/security', (req, res, { auth, query }) => {
+  const bus = query.bus;
+  if (!requireAdmin(auth, res, bus)) return;
+  const r = rangeFrom(query.range, '7d');
+  const rows = securityRows(bus, r.from, r.to);
+  const byType = {}, byStudent = {};
+  rows.forEach((e) => {
+    byType[e.type] = (byType[e.type] || 0) + 1;
+    const k = e.enroll || '?';
+    (byStudent[k] = byStudent[k] || { enroll: e.enroll, name: e.name, count: 0, types: {} }).count++;
+    byStudent[k].types[e.type] = (byStudent[k].types[e.type] || 0) + 1;
+  });
+  ok(res, {
+    range: r.key, from: r.from, to: r.to, total: rows.length, labels: EVENT_LABELS,
+    byType, topStudents: Object.values(byStudent).sort((a, b) => b.count - a.count).slice(0, 10),
+    events: rows.slice(0, 300).map((e) => ({ at: e.at, type: e.type, label: EVENT_LABELS[e.type] || e.type, enroll: e.enroll, name: e.name, trip: e.trip, detail: e.detail, device: e.device })),
   });
 });
 
@@ -836,11 +1014,16 @@ route('GET', '/api/admin/export', (req, res, { auth, query }) => {
   const { byEnroll, recs } = buildReport(bus, from, to, trip);
   const studs = busStudents(bus);
 
-  const log = [['S.No.', 'Student Name', 'Enrollment No.', 'Date', 'Day', 'Time', 'Trip', 'Marked By', 'Marking Type', 'Pickup / Route Point', 'Programme', 'Remarks']];
+  const log = [['S.No.', 'Student Name', 'Enrollment No.', 'Date', 'Day', 'Time', 'Trip', 'Marked By', 'Marking Type', 'Distance from bus (m)', 'GPS accuracy (m)', 'Device', 'Pickup / Route Point', 'Programme', 'Remarks']];
   recs.forEach((r, i) => {
     const st = byEnroll[r.enroll] || {};
     const day = new Date(r.date + 'T00:00:00Z').toLocaleDateString('en-IN', { weekday: 'short', timeZone: 'UTC' });
-    log.push([i + 1, st.name || r.enroll, r.enroll, r.date, day, r.time, r.trip, r.method === 'SELF' ? `${st.name || ''} (self)` : r.markedBy, r.method === 'SELF' ? 'Student marked own attendance (OTP)' : 'Marked manually by admin', st.stop || '', st.programme || '', r.reason || '']);
+    log.push([i + 1, st.name || r.enroll, r.enroll, r.date, day, r.time, r.trip, r.method === 'SELF' ? `${st.name || ''} (self)` : r.markedBy, r.method === 'SELF' ? 'Student marked own attendance (code)' : 'Marked manually by admin',
+      r.dist ?? '', r.acc ?? '', r.device || '', st.stop || '', st.programme || '', r.reason || '']);
+  });
+  const sec = [['Date', 'Time', 'Student Name', 'Enrollment No.', 'Trip', 'Event', 'Details', 'Device']];
+  securityRows(bus, from, to).reverse().forEach((e) => {
+    sec.push([e.date, fmtTime(new Date(e.at)), e.name || '', e.enroll || '', e.trip || '', EVENT_LABELS[e.type] || e.type, e.detail || '', e.device || '']);
   });
 
   const held = new Set([...heldKeys(bus, from, to)].filter((k) => !trip || k.endsWith(trip)));
@@ -869,9 +1052,10 @@ route('GET', '/api/admin/export', (req, res, { auth, query }) => {
   ];
 
   const buf = buildXlsx([
-    { name: 'Attendance', rows: log, widths: [7, 26, 16, 12, 7, 10, 10, 36, 34, 32, 34, 22] },
+    { name: 'Attendance', rows: log, widths: [7, 26, 16, 12, 7, 10, 10, 36, 34, 12, 11, 14, 32, 34, 22] },
     { name: 'Register (P-A)', rows: reg, widths: [7, 26, 16, 30, ...cols.map(() => 9), 9, 9, 7, 7], markPA: true },
     { name: 'Daily Summary', rows: summary, widths: [12, 10, 10, 11, 10, 10, 15, 14] },
+    { name: 'Security Events', rows: sec, widths: [12, 10, 26, 16, 10, 34, 60, 14] },
     { name: 'Report Info', rows: info, widths: [22, 50], headerRow: -1, styles: { '0,0': 4 } },
   ]);
   audit(auth.acc, 'export', `Excel ${from}..${to} ${trip || 'all trips'} (${recs.length} records)`, bus);
@@ -1080,22 +1264,72 @@ route('POST', '/api/super/smtp', async (req, res, { auth, body }) => {
   ok(res);
 });
 
+// Full database download (sessions/login tokens and pending reset codes are left out).
+route('GET', '/api/super/backup', async (req, res, { auth }) => {
+  if (!requireSuper(auth, res)) return;
+  const { tokens, resets, ...rest } = db;
+  const body = JSON.stringify({ ...rest, exportedAt: new Date().toISOString() }, null, 1);
+  audit(auth.acc, 'backup-download', `${(body.length / 1024).toFixed(0)} KB`);
+  save();
+  res.writeHead(200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Disposition': `attachment; filename="uu-bus-backup-${fmtDate()}.json"`,
+    'Cache-Control': 'no-store',
+  });
+  res.end(body);
+});
+route('GET', '/api/super/system', async (req, res, { auth }) => {
+  if (!requireSuper(auth, res)) return;
+  let backups = [];
+  try { backups = (await store.listBackups()).slice(0, 10); } catch {}
+  ok(res, { storage: store.name, lastSaveError, lastBackupDate, backups, students: db.students.filter((s) => s.active !== false).length, records: db.attendance.length, events: db.events.length });
+});
+
 // ---------- server ----------
-loadDb();
+// The server starts listening at once (cloud hosts expect that within seconds) and answers
+// API calls with 503 until the database has loaded from storage.
+let ready = false;
+let loadError = null;
+let loadPromise = null;
+function ensureLoaded() {
+  if (!loadPromise) {
+    loadPromise = loadDb()
+      .then(() => { ready = true; loadError = null; console.log(`  Storage: ${store.name} — database loaded`); })
+      .catch((e) => { loadError = e.message; loadPromise = null; console.error('Could not load the database:', e); });
+  }
+  return loadPromise;
+}
+// Cloud stores that take credentials from incoming requests (Catalyst) load on the first request.
+if (!store.needsRequest) ensureLoaded();
+
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'same-origin',
+  'Permissions-Policy': 'geolocation=(self), microphone=(self), camera=(self)',
+};
 const server = http.createServer(async (req, res) => {
+  for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.setHeader(k, v);
   const url = new URL(req.url, 'http://x');
   const pathname = url.pathname;
+  if (store.needsRequest) store.attach(req);
   if (!pathname.startsWith('/api/')) return serveStatic(req, res, pathname);
+  if (!ready && store.needsRequest) await Promise.race([ensureLoaded(), new Promise((r) => setTimeout(r, 20000))]);
+  if (!ready) {
+    if (pathname === '/api/health') return send(res, 503, { ok: false, starting: !loadError, error: loadError });
+    return fail(res, 503, loadError ? 'Storage error — the administrator has been notified.' : 'The server is starting. Please retry in a few seconds.');
+  }
 
   const vm = req.method === 'GET' && pathname.match(/^\/api\/voice\/([a-f0-9]{24})$/);
   if (vm) {
     const msg = db.chats.find((c) => c.voiceId === vm[1]);
     if (!msg) return fail(res, 404, 'Not found');
-    return fs.readFile(path.join(VOICE_DIR, `${msg.voiceId}.${msg.voiceExt}`), (err, buf) => {
-      if (err) return fail(res, 404, 'Not found');
+    try {
+      const buf = await store.getVoice(`${msg.voiceId}.${msg.voiceExt}`);
+      if (!buf) return fail(res, 404, 'Not found');
       res.writeHead(200, { 'Content-Type': msg.voiceMime, 'Content-Length': buf.length, 'Cache-Control': 'private, max-age=86400' });
-      res.end(buf);
-    });
+      return res.end(buf);
+    } catch (e) { return fail(res, 502, 'Could not load the voice message'); }
   }
 
   const r = routes[`${req.method} ${pathname}`];
@@ -1118,6 +1352,14 @@ server.listen(PORT, () => {
   lan.forEach((a) => console.log(`  Network: http://${a}:${PORT}   (phones on the same Wi-Fi)`));
   console.log('');
 });
-function shutdown() { try { saveNow(); } catch {} process.exit(0); }
+async function shutdown() {
+  if (!ready) process.exit(0);
+  clearTimeout(saveTimer);
+  try {
+    if (store.saveDbSync) store.saveDbSync(snapshot());
+    else await Promise.race([saveNow(), new Promise((r) => setTimeout(r, 5000))]);
+  } catch {}
+  process.exit(0);
+}
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
